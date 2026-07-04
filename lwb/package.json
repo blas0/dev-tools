@@ -1,0 +1,9 @@
+{
+  "name": "lwb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Linux Worktree Box — disposable agent workspaces as git worktrees in a no-mount Lima VM",
+  "bin": {
+    "lwb": "./lwb.ts"
+  }
+}
