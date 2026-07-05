@@ -15,12 +15,16 @@ Work crosses the boundary only as commands in and git diffs out.
   directories into the VM, never edit guest files through any other path.
 - Workspace paths printed by `lwb ls` are GUEST paths. Do not Read/Edit
   them with host tools — they do not exist on the host filesystem.
-- Retrieve results exclusively via `lwb diff <id>` or git (fetch the
-  workspace's `lwb/<id>` branch).
+- Retrieve results exclusively via `lwb diff <id>` (review) and
+  `lwb fetch <id>` (pull the `lwb/<id>` branch into the current host repo).
 - Never copy credentials or secrets from the host into the VM. Agent CLIs
   are authenticated inside the guest by the user, one time, interactively.
 - `lwb destroy` deletes the worktree and its `lwb/`-prefixed branch. Treat
-  it as destructive: confirm with the user unless they already asked.
+  it as destructive: confirm with the user unless they already asked. It
+  refuses when unfetched work would be lost; `--force` is the explicit
+  "yes, discard it" — only pass it after the diff has been reviewed.
+  (`LWB_DESTROY_GUARD=0` disables the refusal wholesale; leave it on
+  when orchestrating agents.)
 
 ## Verbs
 
@@ -33,8 +37,13 @@ lwb ls                                    # list workspaces: id, repo, branch, g
 lwb exec <id> -- <cmd...>                 # run one command in a workspace
 lwb shell <id>                            # interactive shell in a workspace
 lwb agent <id> -- <agentcmd...>           # interactive agent session (claude, codex, ...)
-lwb diff <id>                             # git status --short + git diff
-lwb destroy <id>                          # remove worktree + lwb/ branch
+lwb diff <id>                             # all changes since divergence from the default branch:
+                                          #   status + commits on lwb/<id> + diff + untracked content
+lwb fetch <id>                            # pull the lwb/<id> branch into the current host repo
+lwb destroy <id> [--force]                # remove worktree + lwb/ branch; refuses if unfetched
+                                          #   work would be lost (--force discards it)
+lwb gc                                    # prune stale worktrees, clear guest cache
+lwb doctor                                # preflight: VM up, dirs, git, agent login (exit != 0 on problems)
 ```
 
 Workspace ids are globally unique; if a duplicate ever exists, use
@@ -48,10 +57,12 @@ Transport: default is `limactl shell`. Set `LWB_SSH=<host>` (and optionally
 The fleet pattern — one disposable workspace per task:
 
 ```bash
+lwb doctor               # once, before dispatching: VM up + agent logged in
 lwb create app --name task-1
 lwb exec task-1 -- claude -p "<task prompt>" --permission-mode acceptEdits
 lwb diff task-1          # review the result
-lwb destroy task-1       # or fetch the lwb/task-1 branch first to keep it
+lwb fetch task-1         # keep it: pulls lwb/task-1 into the current host repo
+lwb destroy task-1 --force   # discard it (--force = "yes, lose the unfetched work")
 ```
 
 Runs are independent: parallel tasks get parallel workspaces, never a

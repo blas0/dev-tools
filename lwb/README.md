@@ -85,6 +85,18 @@ Five workspaces created in 0.6–0.9 s each end-to-end from the Mac; five
 concurrent agent-shaped jobs (search + install + edit + status) completed in
 4.6 s total with the guest at load 0.41.
 
+`lwb destroy`'s safety gate (refusing when unfetched work would be lost)
+costs one extra guest round-trip per destroy. Measured end-to-end from the
+Mac (hyperfine, 5 runs, clean workspace):
+
+| Benchmark | guard on (default) | guard off (`LWB_DESTROY_GUARD=0`) |
+| --- | --- | --- |
+| `lwb destroy` | 378 ms | 325 ms |
+
+`--force` skips the check for a single destroy; `LWB_DESTROY_GUARD=0` (or
+`false`/`off`) opts out globally — for teardown-heavy fleets that fetch
+first anyway and want destroys ~50 ms cheaper.
+
 > **Do not mount your Mac project directory into the VM.** Shared-filesystem
 > mounts (virtiofs/9p/sshfs) are slower than native APFS -- a mounted
 > workspace gets Linux process overhead *plus* worse-than-Mac I/O. The entire
@@ -102,8 +114,11 @@ concurrent agent-shaped jobs (search + install + edit + status) completed in
 | `lwb exec <id> -- <cmd...>` | Run a command inside a workspace directory. |
 | `lwb shell <id>` | Open an interactive shell inside a workspace directory. |
 | `lwb agent <id> -- <agentcmd...>` | Launch a coding agent (e.g. `claude`, `codex`) inside a workspace directory. |
-| `lwb diff <id>` | Show `git status --short` and `git diff` for a workspace. |
-| `lwb destroy <id>` | Remove a workspace's worktree and delete its `lwb/` branch. |
+| `lwb diff <id>` | Show everything a workspace changed since it diverged from the repo's default branch: `git status --short`, commits made on `lwb/<id>`, the full diff (committed + staged + unstaged), and the content of untracked files. |
+| `lwb fetch <id>` | Fetch a workspace's `lwb/<id>` branch into the current host git repo (run it from inside that repo). Uses git-over-ssh via Lima's own sshd (or `LWB_SSH` when set); only commits move — uncommitted work stays in the VM. |
+| `lwb destroy <id> [--force]` | Remove a workspace's worktree and delete its `lwb/` branch. Refuses — showing the commits, dirty files, and a diffstat — if the workspace holds work that exists only in the VM; pass `--force` to discard it anyway. Set `LWB_DESTROY_GUARD=0` to disable the check globally (see benchmarks above). |
+| `lwb gc` | Prune stale worktree registrations, empty `~/lwb/cache`, report repos with no workspaces and guest disk usage. Never deletes repos. |
+| `lwb doctor` | Preflight for headless runs: VM running, guest dirs present, git installed, agent CLI logged in (via `claude auth status`, so token auto-refresh is respected). Non-zero exit on problems — gate scripts with `lwb doctor && lwb exec ...`. |
 | `lwb --help` | Show usage. |
 
 Anywhere a command takes `<id>`, `<repo>/<id>` also works.
@@ -138,8 +153,42 @@ lwb exec <id> -- claude -p "<task>" --permission-mode acceptEdits   # headless
 ```
 
 Because the VM has no host mounts, an agent's blast radius is a disposable
-worktree; retrieve its work with `lwb diff <id>` and throw the workspace
-away with `lwb destroy <id>`.
+worktree; review its work with `lwb diff <id>`, keep it with `lwb fetch <id>`
+(run from the host repo that should receive the branch), and throw the
+workspace away with `lwb destroy <id>` — which refuses if unfetched work
+would be lost, unless you pass `--force`.
+
+## Deny-guards for orchestrating sessions
+
+`hooks/lwb-guard.ts` is a Claude Code PreToolUse hook that turns two
+SKILL.md rules into hard denials instead of advisory text:
+
+1. Host file tools (`Read`/`Edit`/`Write`/`NotebookEdit`) may not target
+   guest paths (`/home/<user>/lwb/...` or `~/lwb/...`) -- they don't exist
+   on the host.
+2. Bash commands may not mount host directories into the VM (`limactl`
+   with any `--mount` flag other than `--mount-none`), and may not
+   reference guest paths unless routed through `lwb`, `limactl`, or `ssh`.
+
+Register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "/path/to/lwb/hooks/lwb-guard.ts" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+A denial exits 2 and feeds the reason back to the agent, which then
+self-corrects to `lwb exec` / `lwb diff`.
 
 ## Known quirks
 
@@ -156,4 +205,8 @@ away with `lwb destroy <id>`.
 
 - Zero npm dependencies; uses only `node:child_process` and standard lib.
 - `destroy` refuses to delete branches that don't have the `lwb/` prefix.
-- `lwb diff` lists untracked files as `?? <path>` without content.
+- `lwb diff` diffs against the merge-base with the bare repo's default
+  branch, so work an agent already committed or staged still shows up. If
+  no merge-base exists it falls back to HEAD (uncommitted changes only).
+  Untracked files appear as `diff --no-index` hunks against `/dev/null`
+  (paths render as `a/./<file>`; the `./` guards odd filenames).

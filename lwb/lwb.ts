@@ -7,6 +7,7 @@
 // no database, no state files.
 
 import { spawnSync } from "node:child_process";
+import { homedir } from "node:os";
 
 const VM_NAME = "lwb";
 
@@ -17,6 +18,13 @@ const VM_NAME = "lwb";
 // execution substrate changes.
 const SSH_TARGET = process.env.LWB_SSH;
 const SSH_CONFIG = process.env.LWB_SSH_CONFIG;
+
+// Destroy safety gate: refuse to destroy a workspace whose work exists only
+// in the VM. Costs one extra guest round-trip per destroy; set
+// LWB_DESTROY_GUARD=0 (or false/off) to opt out and destroy immediately.
+const DESTROY_GUARD = !["0", "false", "off"].includes(
+  (process.env.LWB_DESTROY_GUARD ?? "").toLowerCase(),
+);
 
 interface GuestCommand {
   cmd: string;
@@ -551,20 +559,82 @@ function cmdDiff(args: string[]): void {
   }
   const workspace = findWorkspace(id);
 
-  const statusResult = linux(["git", "-C", workspace.path, "status", "--short"]);
-  if (statusResult.code !== 0) {
-    fail(`git status failed for workspace "${id}"`);
-  }
-  const diffResult = linux(["git", "-C", workspace.path, "diff"]);
-  if (diffResult.code !== 0) {
+  // Agents often commit or stage their work, so a bare `git diff` (unstaged
+  // only) silently under-reports. Diff against the point where lwb/<id>
+  // diverged from the repo's default branch, and show untracked file content.
+  // One guest round-trip; the bare repo dir comes from --git-common-dir so no
+  // host-side path knowledge is needed.
+  const script = [
+    `cd ${shQuote(workspace.path)} || exit 1`,
+    `git status --short || exit 1`,
+    `common=$(git rev-parse --git-common-dir)`,
+    `default=$(git --git-dir="$common" symbolic-ref --short HEAD 2>/dev/null)`,
+    `base=$(git merge-base "$default" HEAD 2>/dev/null) || base=$(git rev-parse HEAD)`,
+    `if [ "$base" != "$(git rev-parse HEAD)" ]; then git --no-pager log --oneline "$base..HEAD"; fi`,
+    `git --no-pager diff "$base" || exit 1`,
+    `git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do git --no-pager diff --no-index -- /dev/null "./$f"; done`,
+    `exit 0`,
+  ].join("\n");
+  const result = linux(["bash", "-lc", script]);
+  if (result.code !== 0) {
     fail(`git diff failed for workspace "${id}"`);
   }
 }
 
-function cmdDestroy(args: string[]): void {
+function cmdFetch(args: string[]): void {
   const id = args[0];
   if (!id) {
-    fail("usage: lwb destroy <id>");
+    fail("usage: lwb fetch <id> (run inside the host git repo that should receive the branch)");
+  }
+
+  const hostRepo = spawnSync("git", ["rev-parse", "--git-dir"], { stdio: "pipe" });
+  if ((hostRepo.status ?? 1) !== 0) {
+    fail("lwb fetch must run inside a host git repository (it fetches lwb/<id> into the current repo)");
+  }
+
+  const workspace = findWorkspace(id);
+  const bareRepoDir = guestPath(`lwb/repos/${workspace.repo}.git`);
+
+  // Commits are the only thing fetch can move; uncommitted work stays in the
+  // VM (see `lwb diff`). git-over-ssh is the one git-native channel into the
+  // guest: the default limactl transport has no URL scheme, so route through
+  // Lima's own sshd (or LWB_SSH when set).
+  let host: string;
+  let sshCommand: string;
+  if (SSH_TARGET) {
+    host = SSH_TARGET;
+    sshCommand = SSH_CONFIG ? `ssh -F ${shQuote(SSH_CONFIG)}` : "ssh";
+  } else {
+    host = `lima-${VM_NAME}`;
+    sshCommand = `ssh -F ${shQuote(`${homedir()}/.lima/${VM_NAME}/ssh.config`)}`;
+  }
+
+  const refspec = `${workspace.branch}:${workspace.branch}`;
+  const result = spawnSync(
+    "git",
+    ["-c", `core.sshCommand=${sshCommand}`, "fetch", `ssh://${host}${bareRepoDir}`, refspec],
+    { stdio: "inherit" },
+  );
+  if ((result.status ?? 1) !== 0) {
+    fail(`git fetch failed for workspace "${id}"`);
+  }
+  console.log(`Fetched ${workspace.branch} into the current repo.`);
+}
+
+function cmdDestroy(args: string[]): void {
+  let id: string | undefined;
+  let force = false;
+  for (const arg of args) {
+    if (arg === "--force" || arg === "-f") {
+      force = true;
+    } else if (!id) {
+      id = arg;
+    } else {
+      fail("usage: lwb destroy <id> [--force]");
+    }
+  }
+  if (!id) {
+    fail("usage: lwb destroy <id> [--force]");
   }
   const workspace = findWorkspace(id);
 
@@ -572,6 +642,45 @@ function cmdDestroy(args: string[]): void {
     fail(
       `refusing to destroy workspace "${id}": branch "${workspace.branch}" does not have the lwb/ prefix`,
     );
+  }
+
+  // Destroy deletes commits that exist nowhere else. Unless forced (or the
+  // guard is disabled via LWB_DESTROY_GUARD=0), refuse when the workspace
+  // holds work not on the default branch and show what would be lost (same
+  // merge-base logic as `lwb diff`).
+  if (!force && DESTROY_GUARD) {
+    const script = [
+      `cd ${shQuote(workspace.path)} || exit 1`,
+      `dirty=$(git status --porcelain) || exit 1`,
+      `common=$(git rev-parse --git-common-dir)`,
+      `default=$(git --git-dir="$common" symbolic-ref --short HEAD 2>/dev/null)`,
+      // No merge-base with the default branch means every commit here may
+      // exist only in the VM: fail closed instead of assuming ahead=0.
+      `base=$([ -n "$default" ] && git merge-base "$default" HEAD 2>/dev/null)`,
+      `if [ -z "$base" ]; then`,
+      `  echo "cannot verify this workspace against the default branch; its commits may exist only in the VM:"`,
+      `  echo; git --no-pager log --oneline -20 HEAD`,
+      `  if [ -n "$dirty" ]; then echo; git status --short; fi`,
+      `  exit 3`,
+      `fi`,
+      `ahead=$(git rev-list --count "$base..HEAD")`,
+      `[ -z "$dirty" ] && [ "$ahead" -eq 0 ] && exit 0`,
+      `echo "this workspace still has work that exists only in the VM:"`,
+      `if [ "$ahead" -gt 0 ]; then echo; git --no-pager log --oneline "$base..HEAD"; fi`,
+      `if [ -n "$dirty" ]; then echo; git status --short; fi`,
+      `echo`,
+      `git --no-pager diff --stat "$base"`,
+      `exit 3`,
+    ].join("\n");
+    const check = linux(["bash", "-lc", script]);
+    if (check.code === 3) {
+      fail(
+        `refusing to destroy workspace "${id}": keep the work with \`lwb fetch ${id}\` or discard it with \`lwb destroy ${id} --force\``,
+      );
+    }
+    if (check.code !== 0) {
+      fail(`could not inspect workspace "${id}" before destroy`);
+    }
   }
 
   const bareRepoDir = guestPath(`lwb/repos/${workspace.repo}.git`);
@@ -602,6 +711,71 @@ function cmdDestroy(args: string[]): void {
   console.log(`Destroyed workspace "${id}"`);
 }
 
+function cmdGc(): void {
+  // Reclaim guest disk: prune stale worktree registrations, empty the cache
+  // scratch dir. Repos are only ever reported, never deleted.
+  const script = [
+    `for d in ~/lwb/repos/*.git; do`,
+    `  [ -e "$d" ] || continue`,
+    `  git --git-dir="$d" worktree prune`,
+    `done`,
+    `find ~/lwb/cache -mindepth 1 -delete 2>/dev/null`,
+    `echo "Pruned stale worktree registrations and cleared ~/lwb/cache."`,
+    `for d in ~/lwb/repos/*.git; do`,
+    `  [ -e "$d" ] || continue`,
+    // porcelain lists the bare repo itself as the first "worktree" entry
+    `  n=$(git --git-dir="$d" worktree list --porcelain | grep -c '^worktree ')`,
+    `  [ "$n" -le 1 ] && echo "repo $(basename "$d" .git) has no workspaces (remove it by hand if unwanted)"`,
+    `done`,
+    `echo "Guest disk usage: $(du -sh ~/lwb | cut -f1)"`,
+    `exit 0`,
+  ].join("\n");
+  const { code } = linux(["bash", "-lc", script]);
+  if (code !== 0) {
+    fail("gc failed");
+  }
+}
+
+function cmdDoctor(): void {
+  // Preflight for headless runs: exits non-zero on anything that would make
+  // `lwb exec <id> -- claude -p ...` fail confusingly, so orchestrators can
+  // gate with `lwb doctor && lwb exec ...`.
+  if (!SSH_TARGET) {
+    const vm = findVm();
+    if (!vm) {
+      fail(`no "${VM_NAME}" VM found; run \`lwb setup\``);
+    }
+    if (vm.status !== "Running") {
+      fail(`VM "${VM_NAME}" is ${vm.status}; run \`lwb init\``);
+    }
+    console.log(`ok: VM "${VM_NAME}" is running`);
+  }
+
+  const script = [
+    `status=0`,
+    `for d in ~/lwb/repos ~/lwb/worktrees ~/lwb/cache; do`,
+    `  if [ -d "$d" ]; then echo "ok: $d"; else echo "fail: $d missing (run lwb init)"; status=1; fi`,
+    `done`,
+    `if command -v git >/dev/null; then echo "ok: git $(git --version | cut -d' ' -f3)"; else echo "fail: git not installed (run lwb setup)"; status=1; fi`,
+    // `claude auth status` is authoritative: it accounts for refresh tokens,
+    // which a raw expiresAt check in .credentials.json would misreport.
+    `if command -v claude >/dev/null; then`,
+    `  if claude auth status 2>/dev/null | grep -q '"loggedIn":[[:space:]]*true'; then`,
+    `    echo "ok: claude logged in"`,
+    `  else`,
+    `    echo "fail: claude not logged in; run: limactl shell ${VM_NAME} -- claude auth login"; status=1`,
+    `  fi`,
+    `else`,
+    `  echo "info: claude not installed in guest (optional; lwb setup --claude)"`,
+    `fi`,
+    `exit $status`,
+  ].join("\n");
+  const { code } = linux(["bash", "-lc", script]);
+  if (code !== 0) {
+    fail("doctor found problems");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Usage / help
 // ---------------------------------------------------------------------------
@@ -622,7 +796,12 @@ Commands:
   shell <id>                        Open an interactive shell in a workspace
   agent <id> -- <agentcmd...>       Launch a coding agent in a workspace
   diff <id>                         Show git status/diff for a workspace
-  destroy <id>                      Remove a workspace and its lwb/ branch
+  fetch <id>                        Fetch a workspace's lwb/ branch into the current host repo
+  destroy <id> [--force]            Remove a workspace and its lwb/ branch
+                                     (refuses if unfetched work would be lost, unless --force;
+                                      LWB_DESTROY_GUARD=0 disables the check entirely)
+  gc                                Prune stale worktree registrations, clear the guest cache
+  doctor                            Check VM, guest dirs, and agent credentials (for headless runs)
   --help                            Show this help text
 `;
 
@@ -672,8 +851,17 @@ function main(): void {
     case "diff":
       cmdDiff(rest);
       break;
+    case "fetch":
+      cmdFetch(rest);
+      break;
     case "destroy":
       cmdDestroy(rest);
+      break;
+    case "gc":
+      cmdGc();
+      break;
+    case "doctor":
+      cmdDoctor();
       break;
     default:
       fail(`unknown command "${command}"\n\n${USAGE}`);
