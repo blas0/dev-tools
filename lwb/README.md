@@ -106,22 +106,34 @@ first anyway and want destroys ~50 ms cheaper.
 
 | Command | Description |
 | --- | --- |
-| `lwb setup [--cpus N] [--memory GiB] [--disk GiB] [--claude]` | One-time: create the `lwb` VM (`--mount-none`) if missing, start it, install git/ripgrep, create the `~/lwb` dirs. `--claude` also installs Node.js + Claude Code in the guest. Idempotent -- safe to re-run. |
+| `lwb setup [--cpus N] [--memory GiB] [--disk GiB] [--claude] [--egress-firewall] [--egress-allow <cidr[:port]>] [--egress-off]` | One-time: create the `lwb` VM (`--mount-none`) if missing, start it, install git/ripgrep, create the `~/lwb` dirs. `--claude` also installs Node.js + Claude Code in the guest. `--egress-firewall` applies an opt-in, port-level default-deny egress firewall (nftables table `inet lwb_egress`) in the guest, with `--egress-allow <cidr[:port]>` adding allowances; `--egress-off` removes it. Not persisted across reboot. Idempotent -- safe to re-run. |
 | `lwb init` | Ensure the VM is running and guest dirs exist (lighter than `setup`; no package installs). |
 | `lwb add <git-url> [name]` | Clone a bare repo into `~/lwb/repos/<name>.git`. Name defaults to the repo basename without `.git`. |
 | `lwb create <repo> [--base <ref>] [--name <id>]` | Create a new worktree workspace on branch `lwb/<id>`. `id` defaults to a random adjective-noun pair; `base` defaults to the bare repo's default branch. |
+| `lwb fork <id> [--name <newid>] [--dirty]` | Create a new workspace branched from another workspace's current HEAD (pins the base commit to the source's HEAD at fork time). `--dirty` also replays the source's uncommitted tracked + untracked state. |
 | `lwb ls` | List all workspaces (id, repo, branch, guest path). |
-| `lwb exec <id> -- <cmd...>` | Run a command inside a workspace directory. |
+| `lwb exec <id> [--mem <size>] [--cpus <n>] -- <cmd...>` | Run a command inside a workspace directory. `--mem`/`--cpus` wrap it in a transient `systemd-run --user --scope` (MemoryMax/CPUQuota) to resource-cap it. |
 | `lwb shell <id>` | Open an interactive shell inside a workspace directory. |
-| `lwb agent <id> -- <agentcmd...>` | Launch a coding agent (e.g. `claude`, `codex`) inside a workspace directory. |
+| `lwb agent <id> [--mem <size>] [--cpus <n>] -- <agentcmd...>` | Launch a coding agent (e.g. `claude`, `codex`) inside a workspace directory, optionally resource-capped like `exec`. |
 | `lwb diff <id>` | Show everything a workspace changed since it diverged from the repo's default branch: `git status --short`, commits made on `lwb/<id>`, the full diff (committed + staged + unstaged), and the content of untracked files. |
 | `lwb fetch <id>` | Fetch a workspace's `lwb/<id>` branch into the current host git repo (run it from inside that repo). Uses git-over-ssh via Lima's own sshd (or `LWB_SSH` when set); only commits move — uncommitted work stays in the VM. |
 | `lwb destroy <id> [--force]` | Remove a workspace's worktree and delete its `lwb/` branch. Refuses — showing the commits, dirty files, and a diffstat — if the workspace holds work that exists only in the VM; pass `--force` to discard it anyway. Set `LWB_DESTROY_GUARD=0` to disable the check globally (see benchmarks above). |
-| `lwb gc` | Prune stale worktree registrations, empty `~/lwb/cache`, report repos with no workspaces and guest disk usage. Never deletes repos. |
+| `lwb gc [--reap <duration>] [--dry-run\|-n]` | Prune stale worktree registrations, empty `~/lwb/cache`, report repos with no workspaces and guest disk usage. Never deletes repos. `--reap <7d\|24h\|30m\|90s>` additionally removes workspaces whose worktree mtime is at/above that age -- but only those that pass the same unfetched-work safety guard as `destroy`; guarded workspaces are skipped, never force-destroyed. `--dry-run`/`-n` previews what would be reaped. |
 | `lwb doctor` | Preflight for headless runs: VM running, guest dirs present, git installed, agent CLI logged in (via `claude auth status`, so token auto-refresh is respected). Non-zero exit on problems — gate scripts with `lwb doctor && lwb exec ...`. |
+| `lwb port <guest-port> [--host-port <n>]` | Foreground SSH tunnel forwarding a host port to a guest port (Ctrl-C to stop). Takes no `<id>`: workspaces share one VM-wide network namespace, so a listening port is VM-global. |
 | `lwb --help` | Show usage. |
 
 Anywhere a command takes `<id>`, `<repo>/<id>` also works.
+
+Pass `--json` (anywhere in the args before a `--` separator) on `ls`, `create`,
+`fork`, `diff`, `destroy`, `gc`, and `doctor` for machine-readable output on
+stdout instead of the human-formatted text above; a `--json` after `--` (e.g.
+`lwb exec <id> -- echo --json`) is passed through to the guest command
+untouched, not consumed as the flag.
+
+`--egress-firewall` is a **port-level** default-deny firewall with optional
+CIDR allowances (DNS, git, and http/https stay open by default) -- it is
+*not* a domain allowlist, since nftables cannot filter by hostname.
 
 ## Transports
 
