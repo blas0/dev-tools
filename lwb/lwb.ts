@@ -569,19 +569,57 @@ function cmdAdd(args: string[]): void {
   console.log(`Added repo "${name}" at ${dest}`);
 }
 
+/**
+ * Classify a git remote URL as a network remote (ssh/https/git/scp-like) rather
+ * than a local filesystem path (absolute/relative/~, or file://). Used to decide
+ * how seriously to treat a `git fetch origin` failure in `lwb create`.
+ */
+function isNetworkOrigin(originUrl: string): boolean {
+  const url = originUrl.trim();
+  if (!url) return false;
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(url);
+  if (scheme) {
+    return scheme[1].toLowerCase() !== "file";
+  }
+  // scp-like syntax: user@host:path -- a colon appearing before any slash.
+  const firstColon = url.indexOf(":");
+  const firstSlash = url.indexOf("/");
+  return firstColon !== -1 && (firstSlash === -1 || firstColon < firstSlash);
+}
+
+/**
+ * Decide what `lwb create` should do after `git fetch origin` fails. A network
+ * origin that fails to fetch means we'd silently build the workspace off a stale
+ * base -- quietly eroding lwb's "commands in, git diffs out" promise -- so abort
+ * unless the caller passed --offline. A local-path origin is expected to be
+ * unreachable sometimes, so continue with a warning.
+ */
+function fetchFailureAction(input: {
+  fetchFailed: boolean;
+  originUrl: string;
+  offline: boolean;
+}): "proceed" | "warn" | "abort" {
+  if (!input.fetchFailed) return "proceed";
+  if (input.offline) return "warn";
+  return isNetworkOrigin(input.originUrl) ? "abort" : "warn";
+}
+
 function cmdCreate(args: string[]): void {
   const repo = args[0];
   if (!repo) {
-    fail("usage: lwb create <repo> [--base <ref>] [--name <id>]");
+    fail("usage: lwb create <repo> [--base <ref>] [--name <id>] [--offline]");
   }
 
   let base: string | undefined;
   let id: string | undefined;
+  let offline = false;
   for (let i = 1; i < args.length; i++) {
     if (args[i] === "--base") {
       base = args[++i];
     } else if (args[i] === "--name") {
       id = args[++i];
+    } else if (args[i] === "--offline") {
+      offline = true;
     }
   }
 
@@ -603,9 +641,28 @@ function cmdCreate(args: string[]): void {
 
   const bareRepoDir = guestPath(`lwb/repos/${repo}.git`);
 
-  // Fetch origin, tolerating failure for local-only repos.
+  // Fetch origin so the workspace starts from an up-to-date base. If the fetch
+  // fails against a network remote we'd silently build off a stale base, so
+  // abort unless --offline. A local-path origin is expected to be unreachable
+  // sometimes, so tolerate that with a warning.
   const fetchResult = linux(["git", `--git-dir=${bareRepoDir}`, "fetch", "origin"]);
   if (fetchResult.code !== 0) {
+    const originResult = linux(
+      ["git", `--git-dir=${bareRepoDir}`, "remote", "get-url", "origin"],
+      { capture: true },
+    );
+    const action = fetchFailureAction({
+      fetchFailed: true,
+      originUrl: originResult.stdout,
+      offline,
+    });
+    if (action === "abort") {
+      fail(
+        `git fetch origin failed for repo "${repo}"; refusing to build a workspace ` +
+          `off a stale base. Fix connectivity and retry, or pass --offline to use ` +
+          `the local base anyway.`,
+      );
+    }
     console.error(`warning: git fetch origin failed for repo "${repo}" (continuing)`);
   }
 
@@ -1071,6 +1128,21 @@ function cmdPort(args: string[]): void {
   process.exit(result.status ?? 1);
 }
 
+/**
+ * Build the error shown when `git branch -D` fails after destroy has already
+ * removed the worktree. The branch is now orphaned -- it has no worktree, so it
+ * won't show in `lwb ls` and destroy can't be re-run -- so we hand back the
+ * exact recovery command rather than leaving the user to reconstruct it.
+ */
+function orphanedBranchMessage(bareRepoDir: string, branch: string): string {
+  return [
+    `git branch -D failed for branch "${branch}", but its worktree was already removed.`,
+    `The branch is now orphaned: it won't appear in \`lwb ls\`, and \`lwb destroy\` can't retry it.`,
+    `Remove it manually with:`,
+    `  git --git-dir=${bareRepoDir} branch -D ${branch}`,
+  ].join("\n");
+}
+
 function cmdDestroy(args: string[]): void {
   let id: string | undefined;
   let force = false;
@@ -1161,7 +1233,7 @@ function cmdDestroy(args: string[]): void {
     { capture: jsonOutput },
   );
   if (branchResult.code !== 0) {
-    fail(`git branch -D failed for branch "${workspace.branch}"`);
+    fail(orphanedBranchMessage(bareRepoDir, workspace.branch));
   }
 
   if (jsonOutput) {
@@ -1398,8 +1470,9 @@ Commands:
                                      egress nftables policy in the guest (opt-in); --egress-off removes it
   init                              Ensure the lwb VM is running and guest dirs exist
   add <git-url> [name]              Clone a bare repo into the VM
-  create <repo> [--base <ref>] [--name <id>]
-                                     Create a new worktree workspace
+  create <repo> [--base <ref>] [--name <id>] [--offline]
+                                     Create a new worktree workspace (fetches origin first;
+                                     aborts if a network origin is unreachable unless --offline)
   fork <id> [--name <newid>] [--dirty]
                                      Create a new workspace branched from another workspace's HEAD
                                      (--dirty also replays its uncommitted tracked + untracked state)
@@ -1498,4 +1571,12 @@ function main(): void {
 
 if (import.meta.main) main();
 
-export { parseDuration, cpuQuota, splitJsonFlag, parseEgressAllow };
+export {
+  parseDuration,
+  cpuQuota,
+  splitJsonFlag,
+  parseEgressAllow,
+  isNetworkOrigin,
+  fetchFailureAction,
+  orphanedBranchMessage,
+};
