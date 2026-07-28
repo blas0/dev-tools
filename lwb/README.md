@@ -15,7 +15,7 @@ with plain git inside the guest.
 
 ```bash
 brew install lima bun          # prerequisites (or your package manager)
-git clone https://github.com/blas0/lwb.git && cd lwb
+git clone https://github.com/blas0/dev-tools.git && cd dev-tools/lwb
 bun link                       # exposes `lwb` globally (or run ./lwb.ts directly)
 
 lwb setup                      # one-time: create the VM (--mount-none) + provision it

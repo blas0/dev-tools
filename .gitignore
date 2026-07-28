@@ -1,0 +1,24 @@
+# Repository-wide only. Each project keeps its own .gitignore, which applies
+# to that project's subtree and takes precedence for project-specific rules.
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Local agent / editor tooling
+.claude/
+.mcp_data/
+.mcp.json
+.cursor/
+.idea/
+.vscode/
+
+# Node
+node_modules/
+
+# Secrets
+.env
+.env.*
+!.env.example

@@ -1,0 +1,9 @@
+# Generated lakebed application deploys — kept on disk, never committed.
+deployments/
+
+# Local tooling scratch
+.playwright-mcp/
+.mcp_data/
+
+# macOS
+.DS_Store
