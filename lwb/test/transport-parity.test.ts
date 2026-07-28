@@ -54,6 +54,18 @@ function runExec(args: string[], ssh: boolean): { stdout: string; code: number }
   return { stdout: result.stdout ?? "", code: result.status ?? -1 };
 }
 
+function runAutomationExec(args: string[]): { stdout: string; code: number } {
+  const env = { ...process.env, LWB_AUTOMATION: "1" };
+  delete env.LWB_SSH;
+  delete env.LWB_SSH_CONFIG;
+  const result = spawnSync("bun", [LWB, "exec", "parity-ws", "--", ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    env,
+  });
+  return { stdout: result.stdout ?? "", code: result.status ?? -1 };
+}
+
 describe.skipIf(!usable)("transport parity (limactl shell vs ssh)", () => {
   beforeAll(() => {
     // Clean up leftovers from any crashed prior run before creating fresh state.
@@ -166,5 +178,14 @@ describe.skipIf(!usable)("transport parity (limactl shell vs ssh)", () => {
     expect(ssh.code).toBe(limactl.code);
     expect(limactl.code).toBe(0);
     expect(limactl.stdout).toBe("");
+  }, 30000);
+
+  test("automation mode uses the Lima SSH transport", () => {
+    const args = ["printf", "%s\n", "scheduled task"];
+    const limactl = runExec(args, false);
+    const automation = runAutomationExec(args);
+    expect(automation.stdout).toBe(limactl.stdout);
+    expect(automation.code).toBe(limactl.code);
+    expect(automation.code).toBe(0);
   }, 30000);
 });

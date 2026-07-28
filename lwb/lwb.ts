@@ -16,8 +16,37 @@ const VM_NAME = "lwb";
 // running Linux, or lima's own sshd for testing). Optional LWB_SSH_CONFIG
 // points at an ssh config file (-F). The workspace API stays fixed; only the
 // execution substrate changes.
-const SSH_TARGET = process.env.LWB_SSH;
-const SSH_CONFIG = process.env.LWB_SSH_CONFIG;
+interface TransportConfig {
+  target?: string;
+  config?: string;
+}
+
+/**
+ * Resolve the guest transport from environment variables. Scheduled tasks run
+ * in a read-only host sandbox, so they cannot safely invoke limactl (which may
+ * update Lima cache/runtime files). LWB_AUTOMATION=1 routes directly through
+ * Lima's generated SSH config instead; `lwb autostart` keeps the VM available.
+ */
+function resolveTransport(
+  env: Record<string, string | undefined>,
+  home: string,
+): TransportConfig {
+  if (env.LWB_SSH) {
+    return { target: env.LWB_SSH, config: env.LWB_SSH_CONFIG };
+  }
+  const automation = ["1", "true", "on"].includes(
+    (env.LWB_AUTOMATION ?? "").toLowerCase(),
+  );
+  if (!automation) return {};
+  return {
+    target: "lima-lwb",
+    config: env.LWB_SSH_CONFIG ?? `${home}/.lima/${VM_NAME}/ssh.config`,
+  };
+}
+
+const transport = resolveTransport(process.env, homedir());
+const SSH_TARGET = transport.target;
+const SSH_CONFIG = transport.config;
 
 // Destroy safety gate: refuse to destroy a workspace whose work exists only
 // in the VM. Costs one extra guest round-trip per destroy; set
@@ -53,6 +82,15 @@ function splitJsonFlag(argv: string[]): { argv: string[]; json: boolean } {
   return { argv: [...head, ...tail], json };
 }
 
+function parseDoctorArgs(argv: string[]): { github: boolean } | null {
+  let github = false;
+  for (const arg of argv) {
+    if (arg === "--github") github = true;
+    else return null;
+  }
+  return { github };
+}
+
 interface GuestCommand {
   cmd: string;
   argv: string[];
@@ -86,6 +124,30 @@ interface LinuxOpts {
 interface LinuxResult {
   code: number;
   stdout: string;
+}
+
+interface DoctorCheck {
+  status: string;
+  message: string;
+}
+
+function finalizeDoctorChecks(checks: DoctorCheck[], code: number): {
+  ok: boolean;
+  checks: DoctorCheck[];
+} {
+  const finalized = checks.slice();
+  if (finalized.length === 0) {
+    finalized.push({
+      status: "fail",
+      message: code === 0 ? "doctor returned no guest checks" : "guest transport failed",
+    });
+  } else if (code !== 0 && !finalized.some((check) => check.status === "fail")) {
+    finalized.push({ status: "fail", message: "guest transport failed" });
+  }
+  return {
+    ok: code === 0 && !finalized.some((check) => check.status === "fail"),
+    checks: finalized,
+  };
 }
 
 /** Run a command inside the guest (limactl shell by default, ssh if LWB_SSH). */
@@ -550,6 +612,72 @@ function cmdInit(): void {
     fail("failed to create guest directories");
   }
   console.log("lwb initialized.");
+}
+
+function cmdAutostart(args: string[]): void {
+  let enabled = true;
+  for (const arg of args) {
+    if (arg === "--disable") enabled = false;
+    else fail(`unknown autostart flag "${arg}" (usage: lwb autostart [--disable])`);
+  }
+
+  if (process.env.LWB_SSH || process.env.LWB_AUTOMATION) {
+    fail("autostart manages the local Lima VM; run it without LWB_SSH or LWB_AUTOMATION");
+  }
+
+  const vm = findVm();
+  if (!vm) fail(`no "${VM_NAME}" VM found; run \`lwb setup\` first`);
+
+  if (enabled && vm.status !== "Running") {
+    console.log(`Starting VM "${VM_NAME}" (status: ${vm.status})...`);
+    const startResult = spawnSync("limactl", ["start", VM_NAME], { stdio: "inherit" });
+    if ((startResult.status ?? 1) !== 0) fail(`failed to start VM "${VM_NAME}"`);
+  }
+
+  const autostartResult = spawnSync(
+    "limactl",
+    ["start-at-login", VM_NAME, `--enabled=${enabled}`],
+    { stdio: "inherit" },
+  );
+  if ((autostartResult.status ?? 1) !== 0) {
+    fail(`failed to ${enabled ? "enable" : "disable"} autostart for VM "${VM_NAME}"`);
+  }
+
+  if (enabled) {
+    console.log(`Autostart enabled for VM "${VM_NAME}".`);
+    console.log("Full-access scheduled tasks can now run: LWB_AUTOMATION=1 lwb doctor --json");
+  } else {
+    console.log(`Autostart disabled for VM "${VM_NAME}".`);
+  }
+}
+
+function cmdAuth(args: string[]): void {
+  if (args.length !== 1 || args[0] !== "github") {
+    fail("usage: lwb auth github");
+  }
+
+  const script = [
+    `set -eu`,
+    `umask 077`,
+    `install -d -m 700 "$HOME/.ssh"`,
+    `if [ ! -f "$HOME/.ssh/id_ed25519" ]; then`,
+    `  ssh-keygen -q -t ed25519 -f "$HOME/.ssh/id_ed25519" -N "" -C "lwb-github"`,
+    `fi`,
+    `touch "$HOME/.ssh/known_hosts"`,
+    `chmod 600 "$HOME/.ssh/known_hosts"`,
+    `if ! ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" >/dev/null; then`,
+    `  ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts"`,
+    `fi`,
+    `cat "$HOME/.ssh/id_ed25519.pub"`,
+  ].join("\n");
+  const { code, stdout } = linux(["bash", "-lc", script], { capture: true });
+  if (code !== 0 || !stdout.trim().startsWith("ssh-ed25519 ")) {
+    fail("could not prepare the guest GitHub SSH key");
+  }
+
+  console.log("Add this guest public key to GitHub Settings > SSH and GPG keys:\n");
+  console.log(stdout.trim());
+  console.log("\nThen verify with: lwb doctor --github --json");
 }
 
 function cmdAdd(args: string[]): void {
@@ -1387,11 +1515,14 @@ function cmdGc(args: string[]): void {
   }
 }
 
-function cmdDoctor(): void {
+function cmdDoctor(args: string[]): void {
+  const options = parseDoctorArgs(args);
+  if (!options) fail("usage: lwb doctor [--github]");
+
   // Preflight for headless runs: exits non-zero on anything that would make
   // `lwb exec <id> -- claude -p ...` fail confusingly, so orchestrators can
   // gate with `lwb doctor && lwb exec ...`.
-  const checks: { status: string; message: string }[] = [];
+  const checks: DoctorCheck[] = [];
 
   if (!SSH_TARGET) {
     const vm = findVm();
@@ -1430,6 +1561,14 @@ function cmdDoctor(): void {
     `else`,
     `  echo "info: claude not installed in guest (optional; lwb setup --claude)"`,
     `fi`,
+    ...(options.github ? [
+      `github_auth="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -T git@github.com 2>&1 || true)"`,
+      `if printf '%s' "$github_auth" | grep -qi 'successfully authenticated'; then`,
+      `  echo "ok: github SSH authenticated"`,
+      `else`,
+      `  echo "fail: github SSH not authenticated (run lwb auth github)"; status=1`,
+      `fi`,
+    ] : []),
     `exit $status`,
   ].join("\n");
   const { code, stdout } = linux(["bash", "-lc", script], { capture: jsonOutput });
@@ -1439,9 +1578,9 @@ function cmdDoctor(): void {
       const m = /^(ok|fail|info):\s*(.*)$/.exec(line);
       if (m) checks.push({ status: m[1], message: m[2] });
     }
-    const ok = !checks.some((c) => c.status === "fail");
-    printJson({ ok, checks });
-    if (code !== 0) process.exit(1);
+    const result = finalizeDoctorChecks(checks, code);
+    printJson(result);
+    if (!result.ok) process.exit(1);
     return;
   }
 
@@ -1469,6 +1608,9 @@ Commands:
                                      --egress-firewall applies a port-level default-deny
                                      egress nftables policy in the guest (opt-in); --egress-off removes it
   init                              Ensure the lwb VM is running and guest dirs exist
+  autostart [--disable]             Keep the Lima VM available for scheduled tasks
+                                     that permit local socket access
+  auth github                       Prepare a guest-only GitHub SSH key and print its public key
   add <git-url> [name]              Clone a bare repo into the VM
   create <repo> [--base <ref>] [--name <id>] [--offline]
                                      Create a new worktree workspace (fetches origin first;
@@ -1492,7 +1634,7 @@ Commands:
                                      Prune stale worktree registrations, clear the guest cache
                                      --reap <7d|24h|30m|90s> also removes workspaces at/above
                                      that age that pass the destroy safety guard
-  doctor                            Check VM, guest dirs, and agent credentials (for headless runs)
+  doctor [--github]                 Check VM, guest dirs, agent credentials, and optional GitHub SSH auth
   port <guest-port> [--host-port <n>]
                                      Forward a guest port to the host over SSH (foreground; Ctrl-C to stop)
   --help                            Show this help text
@@ -1524,6 +1666,12 @@ function main(): void {
       break;
     case "init":
       cmdInit();
+      break;
+    case "autostart":
+      cmdAutostart(rest);
+      break;
+    case "auth":
+      cmdAuth(rest);
       break;
     case "add":
       cmdAdd(rest);
@@ -1559,7 +1707,7 @@ function main(): void {
       cmdGc(rest);
       break;
     case "doctor":
-      cmdDoctor();
+      cmdDoctor(rest);
       break;
     case "port":
       cmdPort(rest);
@@ -1572,9 +1720,12 @@ function main(): void {
 if (import.meta.main) main();
 
 export {
+  resolveTransport,
   parseDuration,
   cpuQuota,
   splitJsonFlag,
+  parseDoctorArgs,
+  finalizeDoctorChecks,
   parseEgressAllow,
   isNetworkOrigin,
   fetchFailureAction,
