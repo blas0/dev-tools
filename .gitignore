@@ -18,6 +18,9 @@
 # Node
 node_modules/
 
+# Retired external projects
+/multimail/
+
 # Secrets
 .env
 .env.*
