@@ -1,6 +1,7 @@
 ---
 name: lwb
 description: Manage disposable Linux agent workspaces via the lwb CLI (Linux Worktree Box). Use when the user asks to create, list, run commands or coding agents in, diff, or destroy VM-backed workspaces, or mentions lwb.
+user-invocable: true
 ---
 
 # lwb — Linux Worktree Box
@@ -34,6 +35,8 @@ lwb setup [--claude] [--egress-firewall] [--egress-allow <cidr[:port]>] [--egres
                                           #   --egress-firewall: opt-in port-level default-deny
                                           #   egress (nftables), not a domain allowlist
 lwb init                                  # ensure VM is running, guest dirs exist
+lwb autostart [--disable]                 # keep the VM available for scheduled tasks
+lwb auth github                            # one-time guest SSH key setup; user adds public key to GitHub
 lwb add <git-url> [name]                  # bare-clone a repo into the VM
 lwb create <repo> [--base <ref>] [--name <id>]   # new workspace (worktree + lwb/<id> branch)
 lwb fork <id> [--name <newid>] [--dirty]  # new workspace branched from another's current HEAD
@@ -52,7 +55,7 @@ lwb destroy <id> [--force]                # remove worktree + lwb/ branch; refus
 lwb gc [--reap <duration>] [--dry-run|-n] # prune stale worktrees, clear guest cache
                                           #   --reap <7d|24h|30m|90s>: also destroys workspaces at/above
                                           #   that age that pass the same unfetched-work guard as destroy
-lwb doctor                                # preflight: VM up, dirs, git, agent login (exit != 0 on problems)
+lwb doctor [--github]                     # preflight: VM, dirs, git, agent login, optional GitHub SSH auth
 lwb port <guest-port> [--host-port <n>]   # foreground SSH tunnel host->guest (Ctrl-C to stop); no <id>,
                                           #   ports are VM-global since workspaces share one netns
 ```
@@ -65,13 +68,21 @@ Pass `--json` (before any `--`) on `ls`, `create`, `fork`, `diff`, `destroy`,
 
 Transport: default is `limactl shell`. Set `LWB_SSH=<host>` (and optionally
 `LWB_SSH_CONFIG=<file>`) to target any Linux box over SSH — same verbs.
+Standalone read-only scheduled sandboxes that deny Unix and loopback sockets
+cannot reach LWB. Use a heartbeat attached to a full-access local task (or an
+equivalent context with local socket access). Run `lwb autostart` and `lwb auth
+github` once outside the scheduled run, then prefix commands with
+`LWB_AUTOMATION=1`.
+Gate the run with `LWB_AUTOMATION=1 lwb doctor --github --json` and continue
+only when the process exits zero, JSON reports `"ok": true`, and `checks` is
+non-empty. Never copy a host token into the guest as a substitute.
 
 ## Dispatching headless agent work
 
 The fleet pattern — one disposable workspace per task:
 
 ```bash
-lwb doctor               # once, before dispatching: VM up + agent logged in
+lwb doctor --github      # once, before GitHub work: VM + agent + guest SSH auth
 lwb create app --name task-1
 lwb exec task-1 -- claude -p "<task prompt>" --permission-mode acceptEdits
 lwb diff task-1          # review the result

@@ -4,14 +4,43 @@
 
 import { describe, test, expect } from "bun:test";
 import {
+  resolveTransport,
   parseDuration,
   cpuQuota,
   splitJsonFlag,
+  parseDoctorArgs,
+  finalizeDoctorChecks,
   parseEgressAllow,
   isNetworkOrigin,
   fetchFailureAction,
   orphanedBranchMessage,
 } from "../lwb.ts";
+
+describe("resolveTransport", () => {
+  test("uses limactl by default", () => {
+    expect(resolveTransport({}, "/Users/tester")).toEqual({});
+  });
+
+  test("uses Lima SSH without host writes in automation mode", () => {
+    expect(resolveTransport({ LWB_AUTOMATION: "1" }, "/Users/tester")).toEqual({
+      target: "lima-lwb",
+      config: "/Users/tester/.lima/lwb/ssh.config",
+    });
+  });
+
+  test("preserves an explicitly configured SSH transport", () => {
+    expect(
+      resolveTransport(
+        {
+          LWB_AUTOMATION: "1",
+          LWB_SSH: "remote-builder",
+          LWB_SSH_CONFIG: "/tmp/ssh.config",
+        },
+        "/Users/tester",
+      ),
+    ).toEqual({ target: "remote-builder", config: "/tmp/ssh.config" });
+  });
+});
 
 describe("parseDuration", () => {
   test("parses each unit into seconds", () => {
@@ -48,6 +77,51 @@ describe("splitJsonFlag", () => {
     const { argv, json } = splitJsonFlag(["diff", "abc"]);
     expect(json).toBe(false);
     expect(argv).toEqual(["diff", "abc"]);
+  });
+});
+
+describe("parseDoctorArgs", () => {
+  test("keeps the default doctor checks", () => {
+    expect(parseDoctorArgs([])).toEqual({ github: false });
+  });
+
+  test("enables the GitHub SSH authentication check", () => {
+    expect(parseDoctorArgs(["--github"])).toEqual({ github: true });
+  });
+
+  test("rejects unknown doctor flags", () => {
+    expect(parseDoctorArgs(["--unknown"])).toBeNull();
+  });
+});
+
+describe("finalizeDoctorChecks", () => {
+  test("rejects an empty result when the guest transport failed", () => {
+    expect(finalizeDoctorChecks([], 1)).toEqual({
+      ok: false,
+      checks: [{ status: "fail", message: "guest transport failed" }],
+    });
+  });
+
+  test("rejects an empty result even when the process exited zero", () => {
+    expect(finalizeDoctorChecks([], 0)).toEqual({
+      ok: false,
+      checks: [{ status: "fail", message: "doctor returned no guest checks" }],
+    });
+  });
+
+  test("preserves successful non-empty checks", () => {
+    const checks = [{ status: "ok", message: "git 2.53.0" }];
+    expect(finalizeDoctorChecks(checks, 0)).toEqual({ ok: true, checks });
+  });
+
+  test("adds a transport failure when output looked healthy but exit was nonzero", () => {
+    expect(finalizeDoctorChecks([{ status: "ok", message: "git 2.53.0" }], 1)).toEqual({
+      ok: false,
+      checks: [
+        { status: "ok", message: "git 2.53.0" },
+        { status: "fail", message: "guest transport failed" },
+      ],
+    });
   });
 });
 
